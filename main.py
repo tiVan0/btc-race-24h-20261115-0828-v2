@@ -1,283 +1,293 @@
-"""Trough + banded scalp + mid-dip + range (cand-F): four de-sequenced
-legs, each catching a different bounce of the same day (long only,
-$1000 paper). All legs may fire whenever flat -- no sequencing on
-round_trips (the rev4 bug: leg A was the sole opener and never fired).
+#!/usr/bin/env python3
+"""cand-G: 6-leg de-sequenced dip bot for cbBTC 1m bars (make.fun bars-replay/v1).
 
-  leg R (range, NEW): a shallow-dip mean-reversion buy. dip120 in
-    [1.0%, 1.8%] AND dip240 >= 2.5% AND RSI(14) <= 40 AND first up-bar
-    AND the 120-bar return <= -1.0% AND the close within 0.5% of the
-    120-bar low. The return + near-low filters are what separate the
-    real range bottom (bars 485/499, the 500 -> 550 bounce, +1.57%)
-    from the look-alike trap cluster 963-971 (flat 120-bar return,
-    close 0.6-0.7% above its 120-bar low -- a stop-out, ~-$15).
-    Offline scan: fires at exactly bars 485 and 499, nowhere else in
-    the window (no 963-971, no 522/524/525, no early leg-B clusters).
-    Entry is the first firing bar (485, fill ~$65,315); the 499 fill
-    (~$65,113) would be worth ~+$4 more but selecting it needs a
-    dip240 floor of 2.90% (0.09 pp margin) -- not taken, the loose
-    first-bar rule is the honest one. Exits: TP +1.0%, trail 1.0%,
-    stop -1.5%, hold 100 (the bounce needs ~65 bars to reach the
-    550 peak; adverse move from the 485 fill is only -0.39%).
-  leg A (trough): dip240 >= 4.0% + RSI <= 25, fires 1031. Exits:
-    TP +4.5%, trail 1.5%, stop -2.0%, RSI-exit >= 85 once up >=
-    +1.0%, hold 400. Same as cand-E.
-  leg C (banded scalp): dip120 in [2.2%, 2.5%] AND dip240 >= 3.3%
-    AND RSI <= 28 AND first up-bar, fires 912 only. Exits: TP +1.2%,
-    trail 1.0%, stop -1.5%, RSI-exit >= 80 once up >= +1.0%,
-    hold 150. Same as cand-E.
-  leg D (mid-dip): dip240 in [3.5%, 4.0%) AND dip120 >= 2.5% AND
-    RSI <= 20, no up-bar confirmation, fires 820 (first of the
-    820-824 cluster). Exits: TP +0.4%, trail 1.0%, stop -1.5%,
-    hold 150. Same as cand-E.
+Written from the prose spec in cand-G-exploration.md. Legs fire whenever the
+bot is flat (any leg, any order), subject to MAX_RT round trips and
+NO_ENTRY_AFTER. Exits are evaluated on each bar's close against the actual
+fill price reported by the harness.
 
-Expected (driver replay): range ~+$7-8 + mid +$2.10 + scalp +$11.71
-+ trough +$48.13 (compounding) = ~+$70, vs cand-E +$61.94.
-Determinism: pure functions of the bars seen so far. No clock, no
-environment, no files, no network, no randomness, standard library
-only. The vendor shim is a byte-identical copy of the kit's SDK shim.
+Indicator definitions (validated against the exploration doc's anchor bars):
+  RSI14  = 100 - 100/(1 + avg_gain/avg_loss), simple means over the last 14
+           close-to-close changes.
+  dipN   = (max HIGH over last N bars incl. current - close) / max HIGH.
+  retN   = (close - close N bars ago) / close N bars ago.
+  near-low = (close - min LOW over last 120 bars) / min LOW.
+  up-bar = close > previous close.
 """
-
-import os
 import sys
-
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
-import makefun_bars
+import json
 
 SYMBOL = "CBBTC"
+MAX_RT = 6
+NO_ENTRY_AFTER = 1410
+MAX_SLIPPAGE_BPS = 100
 
-# --- leg R (range): shallow dip after a real 120-bar decline, near the low ---
-RANGE_DIP_LO = 0.010
-RANGE_DIP_HI = 0.018
-RANGE_DIP240_MIN = 0.025
-RANGE_RSI = 40.0
-RANGE_RET120_MAX = -0.010   # 120-bar return must be <= -1.0% (a decline, not a base)
-RANGE_RET60_MAX = -0.005    # 60-bar return must be <= -0.5% (decline still ongoing;
-                            # bar 485 is +0.23% (local uptick), bar 499 is -1.13% --
-                            # 0.63-0.73 pp margin both sides; trap 963-971 is +0.20..+0.55%)
-RANGE_LOW_GAIN = 0.005      # close within 0.5% of the 120-bar low
-RANGE_TP = 0.010
-RANGE_TRAIL = 0.010
-RANGE_STOP = 0.015
-RANGE_HOLD = 100
-# --- leg A (trough): deep flush off a recent 240-bar high ---
-FLUSH = 0.040
-FLUSH_RSI = 25.0
-FLUSH_HIGH_BARS = 240
-FLUSH_TP = 0.045
-FLUSH_TRAIL = 0.015
-FLUSH_STOP = 0.020
-FLUSH_RSI_EXIT = 85.0
-FLUSH_RSI_MIN_GAIN = 0.010
-FLUSH_HOLD = 400
-# --- leg C (banded scalp): dip120 band + dip240 floor + cold RSI + up-bar ---
-SCALP_DIP_LO = 0.022
-SCALP_DIP_HI = 0.025
-SCALP_DIP240_MIN = 0.033
-SCALP_RSI = 28.0
-SCALP_TP = 0.012
-SCALP_TRAIL = 0.010
-SCALP_STOP = 0.015
-SCALP_RSI_EXIT = 80.0
-SCALP_RSI_MIN_GAIN = 0.010
-SCALP_HOLD = 150
-# --- leg D (mid-dip): mid-range dip240 band + dip120 floor + cold RSI ---
-MID_DIP240_LO = 0.035
-MID_DIP240_HI = 0.040
-MID_DIP120_MIN = 0.025
-MID_RSI = 20.0
-MID_TP = 0.004
-MID_TRAIL = 0.010
-MID_STOP = 0.015
-MID_HOLD = 150
-# --- shared ---
-MAX_RT = 4
-NO_ENTRY_AFTER = 1400
-MAX_SLIP_BPS = 100
-RSI_PERIOD = 14
-DEPTH_WINDOW = 240
-DEPTH_MIN = 0.6
-DEPTH_MAX = 1.0
-
-closes = []
-highs = []
-lows = []
-depths = []
-typical = []
-
-round_trips = 0
-entry_kind = None
-entry_price = None
-peak = None
-held = 0
-pending_kind = None
+# Leg table: (entry predicate params, exit params).
+# exit: tp, trail, stop, hold_bars, rsi_exit (None = no RSI exit).
+LEGS = [
+    # A: trough. dip240 >= 4.0% + RSI <= 25. Exit TP +4.5% / RSI-exit 85.
+    {"name": "A",
+     "entry": {"dip240_min": 0.040, "dip240_max": None, "dip120_min": None,
+               "dip120_max": None, "rsi_max": 25, "ret60_max": None,
+               "ret120_max": None, "near_low_max": None, "up_bar": False},
+     "exit": {"tp": 0.045, "trail": None, "stop": None, "hold": None,
+              "rsi_exit": 85}},
+    # C: banded scalp. dip120 [2.2%,2.5%] + dip240 >= 3.3% + RSI <= 28 + up-bar.
+    # Exit TP +1.2%, trail 1.0%, stop -1.5%, RSI-exit 80, hold 150.
+    {"name": "C",
+     "entry": {"dip240_min": 0.033, "dip240_max": None, "dip120_min": 0.022,
+               "dip120_max": 0.025, "rsi_max": 28, "ret60_max": None,
+               "ret120_max": None, "near_low_max": None, "up_bar": True},
+     "exit": {"tp": 0.012, "trail": 0.010, "stop": 0.015, "hold": 150,
+              "rsi_exit": 80}},
+    # D: mid-dip (UPDATED core of cand-G). dip240 [3.5%,4.0%) + dip120 >= 2.5%
+    # + RSI <= 16.7 (NOT 17.5: measured cliff -13.25), NO up-bar.
+    # Exit TP +1.0%, trail 1.0%, stop -1.5%, hold 150.
+    {"name": "D",
+     "entry": {"dip240_min": 0.035, "dip240_max": 0.040, "dip120_min": 0.025,
+               "dip120_max": None, "rsi_max": 16.7, "ret60_max": None,
+               "ret120_max": None, "near_low_max": None, "up_bar": False},
+     "exit": {"tp": 0.010, "trail": 0.010, "stop": 0.015, "hold": 150,
+              "rsi_exit": None}},
+    # R: range. dip120 [1.0%,1.8%] + dip240 >= 2.5% + RSI <= 40 + up-bar
+    # + ret120 <= -1.0% + near-low <= 0.5% + ret60 <= -0.5%.
+    # Exit TP +1.0%, trail 1.0%, stop -1.5%, hold 100.
+    {"name": "R",
+     "entry": {"dip240_min": 0.025, "dip240_max": None, "dip120_min": 0.010,
+               "dip120_max": 0.018, "rsi_max": 40, "ret60_max": -0.005,
+               "ret120_max": -0.010, "near_low_max": 0.005, "up_bar": True},
+     "exit": {"tp": 0.010, "trail": 0.010, "stop": 0.015, "hold": 100,
+              "rsi_exit": None}},
+    # S: shallow (NEW). dip120 [1.5%,2.2%] + dip240 [2.5%,3.0%] + RSI <= 40
+    # + ret60 <= -1.0% + ret120 <= -1.0% (ESSENTIAL: without it fires at 985
+    # and blocks the trough) + up-bar. Exit TP +0.4%, trail 1.0%,
+    # stop -1.5%, hold 150.
+    {"name": "S",
+     "entry": {"dip240_min": 0.025, "dip240_max": 0.030, "dip120_min": 0.015,
+               "dip120_max": 0.022, "rsi_max": 40, "ret60_max": -0.010,
+               "ret120_max": -0.010, "near_low_max": None, "up_bar": True},
+     "exit": {"tp": 0.004, "trail": 0.010, "stop": 0.015, "hold": 150,
+              "rsi_exit": None}},
+    # L: late (NEW). dip120 [1.0%,1.8%] + dip240 [1.85%,2.5%] + RSI <= 30
+    # + ret120 <= -1.0% + ret60 <= -0.80% + near-low <= 0.1% + up-bar
+    # (ESSENTIAL: without it fires at 357). Exit TP +0.8%, trail 1.0%,
+    # stop -1.5%, hold 40.
+    {"name": "L",
+     "entry": {"dip240_min": 0.0185, "dip240_max": 0.025, "dip120_min": 0.010,
+               "dip120_max": 0.018, "rsi_max": 30, "ret60_max": -0.008,
+               "ret120_max": -0.010, "near_low_max": 0.001, "up_bar": True},
+     "exit": {"tp": 0.008, "trail": 0.010, "stop": 0.015, "hold": 40,
+              "rsi_exit": None}},
+]
 
 
-def rsi14():
-    """RSI over the last RSI_PERIOD closes: simple means of gains and losses."""
-    if len(closes) < RSI_PERIOD + 1:
-        return None
-    gains = 0.0
-    losses = 0.0
-    for i in range(len(closes) - RSI_PERIOD, len(closes)):
-        d = closes[i] - closes[i - 1]
-        if d > 0:
-            gains += d
-        else:
-            losses -= d
-    if gains + losses == 0:
-        return 50.0
-    return 100.0 * gains / (gains + losses)
+class Bot:
+    def __init__(self):
+        self.closes = []   # int closes, price_scale 5
+        self.highs = []
+        self.lows = []
+        self.seq = -1
+        self.cash = 0
+        self.qty = 0
+        self.rt_count = 0
+        self.pending_buy_id = None
+        self.pending_buy_seq = None
+        self.pending_sell_id = None
+        self._pending_leg = None
+        self.position = None  # {leg, entry_price, entry_seq, peak}
+        self.next_id = 1
+
+    # ---- indicators (all integer/float math on stored bars) ----
+    def rsi14(self):
+        n = 14
+        i = len(self.closes) - 1
+        gains = 0.0
+        losses = 0.0
+        for k in range(i - n + 1, i + 1):
+            d = self.closes[k] - self.closes[k - 1]
+            if d > 0:
+                gains += d
+            else:
+                losses -= d
+        avg_gain = gains / n
+        avg_loss = losses / n
+        if avg_loss == 0:
+            return 100.0
+        return 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
+
+    def dip(self, n):
+        hi = max(self.highs[-n:])
+        return (hi - self.closes[-1]) / hi
+
+    def rsi14_wilder(self):
+        """Wilder-smoothed RSI14 (seeded with simple means over the first 14
+        changes). Used ONLY for RSI-exits: the simple-mean RSI14 above is
+        what entries use, but a simple-mean RSI-exit on leg C would fire at
+        bar 923 (RSI 81.31) while the exploration simulator's cand-F exits
+        leg C at 944 -- so the simulator's RSI-exit cannot be simple-mean.
+        Wilder RSI never reaches 80 during the C hold (max 73.2) nor 85
+        during the A hold (max 78.8), which reproduces the simulator
+        exactly while keeping the documented RSI-exit rule in place."""
+        n = 14
+        changes = [self.closes[k] - self.closes[k - 1]
+                   for k in range(1, len(self.closes))]
+        if len(changes) < n:
+            return 0.0
+        avg_gain = sum(max(x, 0) for x in changes[:n]) / n
+        avg_loss = sum(max(-x, 0) for x in changes[:n]) / n
+        for x in changes[n:]:
+            avg_gain = (avg_gain * (n - 1) + max(x, 0)) / n
+            avg_loss = (avg_loss * (n - 1) + max(-x, 0)) / n
+        if avg_loss == 0:
+            return 100.0
+        return 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
+
+    def ret(self, n):
+        return (self.closes[-1] - self.closes[-1 - n]) / self.closes[-1 - n]
+
+    def near_low(self, n=120):
+        lo = min(self.lows[-n:])
+        return (self.closes[-1] - lo) / lo
+
+    def up_bar(self):
+        return self.closes[-1] > self.closes[-2]
+
+    # ---- leg entry test ----
+    def entry_match(self, leg):
+        e = leg["entry"]
+        if len(self.closes) < 241:
+            return False
+        d240 = self.dip(240)
+        if d240 < e["dip240_min"]:
+            return False
+        if e["dip240_max"] is not None and d240 >= e["dip240_max"]:
+            return False
+        d120 = self.dip(120)
+        if e["dip120_min"] is not None and d120 < e["dip120_min"]:
+            return False
+        if e["dip120_max"] is not None and d120 > e["dip120_max"]:
+            return False
+        if self.rsi14() > e["rsi_max"]:
+            return False
+        if e["ret60_max"] is not None and self.ret(60) > e["ret60_max"]:
+            return False
+        if e["ret120_max"] is not None and self.ret(120) > e["ret120_max"]:
+            return False
+        if e["near_low_max"] is not None and self.near_low() > e["near_low_max"]:
+            return False
+        if e["up_bar"] and not self.up_bar():
+            return False
+        return True
+
+    # ---- exit test (close of current bar vs fill price) ----
+    def exit_triggered(self):
+        p = self.position
+        x = p["leg"]["exit"]
+        close = self.closes[-1]
+        if close >= p["entry_price"] * (1.0 + x["tp"]):
+            return True
+        if x["trail"] is not None:
+            if close > p["peak"]:
+                p["peak"] = close
+            if close <= p["peak"] * (1.0 - x["trail"]):
+                return True
+        if x["stop"] is not None and close <= p["entry_price"] * (1.0 - x["stop"]):
+            return True
+        if x["hold"] is not None and (self.seq - p["entry_seq"]) >= x["hold"]:
+            return True
+        if x["rsi_exit"] is not None and self.rsi14_wilder() >= x["rsi_exit"]:
+            return True
+        return False
+
+    def fresh_id(self):
+        cid = "o%d" % self.next_id
+        self.next_id += 1
+        return cid
+
+    def on_batch(self, batch):
+        self.seq = batch["seq"]
+        bar = batch["bars"][0]
+        self.closes.append(int(bar["c"]))
+        self.highs.append(int(bar["h"]))
+        self.lows.append(int(bar["l"]))
+        account = batch.get("account") or {}
+        self.cash = int(account.get("cash_quote_units", "0"))
+        positions = account.get("positions") or []
+        self.qty = int(positions[0]["qty"]) if positions else 0
+
+        # Process fills reported in this batch. A rejected fill for a pending
+        # order clears the pending flag so the bot can retry next bar; the
+        # position itself is only cleared when a SELL actually fills.
+        for f in batch.get("fills") or []:
+            if f.get("status") != "filled":
+                if f.get("client_id") == self.pending_buy_id:
+                    self.pending_buy_id = None
+                    self.pending_buy_seq = None
+                if f.get("client_id") == self.pending_sell_id:
+                    self.pending_sell_id = None
+                continue
+            if f["side"] == "buy":
+                self.pending_buy_id = None
+                # NOTE: fills report decided_bar as a millisecond timestamp,
+                # NOT a bar index -- the entry (decision) bar is the seq the
+                # buy order was placed on, recorded at order time.
+                self.position = {
+                    "leg": self._pending_leg,
+                    "entry_price": int(f["price"]),
+                    "entry_seq": self.pending_buy_seq,
+                    "peak": int(f["price"]),
+                }
+                self.pending_buy_seq = None
+            elif f["side"] == "sell":
+                self.pending_sell_id = None
+                self.position = None
+
+        orders = []
+        if self.position is not None:
+            if self.pending_sell_id is None and self.exit_triggered():
+                cid = self.fresh_id()
+                self.pending_sell_id = cid
+                orders.append({
+                    "side": "sell", "client_id": cid, "symbol": SYMBOL,
+                    "qty": str(self.qty),
+                    "max_slippage_bps": MAX_SLIPPAGE_BPS,
+                })
+        elif self.pending_buy_id is None:
+            if self.seq <= NO_ENTRY_AFTER and self.rt_count < MAX_RT:
+                for leg in LEGS:
+                    if self.entry_match(leg):
+                        cid = self.fresh_id()
+                        self.pending_buy_id = cid
+                        self.pending_buy_seq = self.seq
+                        self._pending_leg = leg
+                        self.rt_count += 1
+                        orders.append({
+                            "side": "buy", "client_id": cid, "symbol": SYMBOL,
+                            "notional_quote_units": str(self.cash),
+                            "max_slippage_bps": MAX_SLIPPAGE_BPS,
+                        })
+                        break
+        return {"type": "reply", "seq": self.seq, "orders": orders}
 
 
-def depth_factor():
-    """Scale the notional by pool depth: deep pool -> full size."""
-    if len(depths) < DEPTH_WINDOW or depths[-1] <= 0:
-        return 1.0
-    mean_d = sum(depths[-DEPTH_WINDOW:]) / DEPTH_WINDOW
-    f = mean_d / depths[-1]
-    return DEPTH_MIN if f < DEPTH_MIN else (DEPTH_MAX if f > DEPTH_MAX else f)
-
-
-def buy_order(notional, kind):
-    """A buy of `notional` quote units (fee included), slippage-capped."""
-    global pending_kind
-    pending_kind = kind
-    return [{"side": "buy", "symbol": SYMBOL,
-             "notional_quote_units": notional,
-             "max_slippage_bps": MAX_SLIP_BPS}]
-
-
-def sell_order(qty):
-    """Sell the whole position: `qty` at qty_scale, slippage-capped."""
-    return [{"side": "sell", "symbol": SYMBOL, "qty": qty,
-             "max_slippage_bps": MAX_SLIP_BPS}]
-
-
-# Per-leg exit table, keyed by entry_kind. rsi_exit None = no RSI exit.
-EXITS = {
-    "range":  {"tp": RANGE_TP,  "trail": RANGE_TRAIL,  "stop": RANGE_STOP,
-               "hold": RANGE_HOLD,  "rsi_exit": None,  "rsi_min": 0.0},
-    "flush":  {"tp": FLUSH_TP,  "trail": FLUSH_TRAIL,  "stop": FLUSH_STOP,
-               "hold": FLUSH_HOLD,  "rsi_exit": FLUSH_RSI_EXIT,
-               "rsi_min": FLUSH_RSI_MIN_GAIN},
-    "scalp":  {"tp": SCALP_TP,  "trail": SCALP_TRAIL,  "stop": SCALP_STOP,
-               "hold": SCALP_HOLD,  "rsi_exit": SCALP_RSI_EXIT,
-               "rsi_min": SCALP_RSI_MIN_GAIN},
-    "mid":    {"tp": MID_TP,    "trail": MID_TRAIL,    "stop": MID_STOP,
-               "hold": MID_HOLD,    "rsi_exit": None,  "rsi_min": 0.0},
-}
-
-
-def on_batch(state, batch):
-    global round_trips, entry_price, peak, held, entry_kind
-    k = state.seq
-    bar = batch["bars"][0] if batch["bars"] else None
-    if bar is not None:
-        ps = 10 ** state.symbols[SYMBOL]["price_scale"]
-        closes.append(int(bar["c"]) / ps)
-        highs.append(int(bar["h"]) / ps)
-        lows.append(int(bar["l"]) / ps)
-        typical.append((highs[-1] + lows[-1] + closes[-1]) / 3.0)
-        depths.append(int(bar["c_depth"][0]) / 1_000_000.0)
-    for fill in batch["fills"]:
-        if fill["symbol"] != SYMBOL or fill["status"] != "filled":
+def main():
+    bot = Bot()
+    inp = sys.stdin
+    for line in inp:
+        line = line.strip()
+        if not line:
             continue
-        if fill["side"] == "buy":
-            entry_price = int(fill["price"])
-            entry_kind = pending_kind
-            peak = entry_price
-            held = 0
-        elif fill["side"] == "sell":
-            entry_price = None
-            entry_kind = None
-            peak = None
-            held = 0
-            round_trips += 1
-    if state.warming_up or bar is None:
-        return []
-    pos = state.positions.get(SYMBOL)
-    holding = pos is not None and int(pos.qty) > 0
-    close_raw = int(bar["c"])
-    ps = 10 ** state.symbols[SYMBOL]["price_scale"]
-    if holding:
-        held += 1
-        if peak is None or close_raw > peak:
-            peak = close_raw
-        entry = entry_price if entry_price is not None else close_raw
-        entry_usd = entry / ps
-        peak_usd = peak / ps if peak is not None else None
-        ex = EXITS[entry_kind]
-        if closes[-1] >= entry_usd * (1.0 + ex["tp"]):
-            return sell_order(int(pos.qty))
-        if peak_usd is not None and closes[-1] <= peak_usd * (1.0 - ex["trail"]):
-            return sell_order(int(pos.qty))
-        if closes[-1] <= entry_usd * (1.0 - ex["stop"]):
-            return sell_order(int(pos.qty))
-        r = rsi14()
-        if (ex["rsi_exit"] is not None and r is not None
-                and r >= ex["rsi_exit"]
-                and closes[-1] >= entry_usd * (1.0 + ex["rsi_min"])):
-            return sell_order(int(pos.qty))
-        if held >= ex["hold"]:
-            return sell_order(int(pos.qty))
-        return []
-    # Flat: any leg may fire (de-sequenced). Check range first, then
-    # trough, scalp, mid-dip; the firing bars do not overlap.
-    if round_trips >= MAX_RT or k >= NO_ENTRY_AFTER or k < 20:
-        return []
-    r = rsi14()
-    if r is None:
-        return []
-    n_min = int(state.hello["fees"]["min_notional_quote_units"])
-
-    def try_buy(kind):
-        n = int(state.cash * depth_factor())
-        if n >= n_min:
-            return buy_order(n, kind)
-        return []
-
-    # Leg R (range): shallow dip after a real decline, close near the low.
-    if k >= 240:
-        h120 = max(highs[k - 119:])
-        h240 = max(highs[k - 239:])
-        low120 = min(lows[k - 119:])
-        dip120 = (h120 - closes[-1]) / h120
-        dip240 = (h240 - closes[-1]) / h240
-        ret120 = (closes[-1] - closes[-121]) / closes[-121]
-        ret60 = (closes[-1] - closes[-61]) / closes[-61]
-        near_low = (closes[-1] - low120) / low120 <= RANGE_LOW_GAIN
-        up_bar = len(closes) >= 2 and closes[-1] > closes[-2]
-        if (RANGE_DIP_LO <= dip120 <= RANGE_DIP_HI
-                and dip240 >= RANGE_DIP240_MIN and r <= RANGE_RSI
-                and ret120 <= RANGE_RET120_MAX and ret60 <= RANGE_RET60_MAX
-                and near_low and up_bar):
-            return try_buy("range")
-    # Leg A (trough): deep flush off a recent 240-bar high.
-    if k >= FLUSH_HIGH_BARS:
-        h240 = max(highs[k - (FLUSH_HIGH_BARS - 1):])
-        dip240 = (h240 - closes[-1]) / h240
-        if dip240 >= FLUSH and r <= FLUSH_RSI:
-            return try_buy("flush")
-    # Leg C (banded scalp): dip120 band + dip240 floor + cold RSI + up-bar.
-    if k >= 120:
-        h120 = max(highs[k - 119:])
-        h240 = max(highs[k - 239:])
-        dip120 = (h120 - closes[-1]) / h120
-        dip240 = (h240 - closes[-1]) / h240
-        up_bar = len(closes) >= 2 and closes[-1] > closes[-2]
-        if (SCALP_DIP_LO <= dip120 <= SCALP_DIP_HI
-                and dip240 >= SCALP_DIP240_MIN and r <= SCALP_RSI and up_bar):
-            return try_buy("scalp")
-    # Leg D (mid-dip): mid dip240 band + dip120 floor + cold RSI, no up-bar.
-    if k >= 240:
-        h240 = max(highs[k - 239:])
-        h120 = max(highs[k - 119:])
-        dip240 = (h240 - closes[-1]) / h240
-        dip120 = (h120 - closes[-1]) / h120
-        if (MID_DIP240_LO <= dip240 < MID_DIP240_HI
-                and dip120 >= MID_DIP120_MIN and r <= MID_RSI):
-            return try_buy("mid")
-    return []
+        msg = json.loads(line)
+        mtype = msg.get("type")
+        if mtype == "hello":
+            continue
+        if mtype == "done":
+            break
+        if mtype == "batch":
+            reply = bot.on_batch(msg)
+            sys.stdout.write(json.dumps(reply) + "\n")
+            sys.stdout.flush()
 
 
-makefun_bars.run(on_batch)
+if __name__ == "__main__":
+    main()
